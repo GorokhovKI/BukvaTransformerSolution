@@ -4,7 +4,6 @@ import cv2
 import torch
 import mediapipe as mp
 import numpy as np
-import platform
 from collections import deque
 from PIL import Image, ImageDraw, ImageFont
 from model import SignLanguageTransformer
@@ -15,7 +14,6 @@ STABILITY_FRAMES = 40
 CONFIDENCE_THRESH = 0.70
 
 def get_font(size=32):
-    system = platform.system()
     font_path = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
     try:
         if font_path:
@@ -83,7 +81,7 @@ def draw_interface_pil(img_cv2, text_pred, conf, subtitles, font_ui, font_sub):
 
         display_sub = subtitles
         while text_w > W - 40:
-            display_sub = display_sub[1:]  # Откусываем начало
+            display_sub = display_sub[1:]
             bbox = draw.textbbox((0, 0), display_sub, font=font_sub)
             text_w = bbox[2] - bbox[0]
 
