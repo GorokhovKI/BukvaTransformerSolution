@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import math
+from torch import Tensor
+from typing import Optional
 from constants import INPUT_SIZE, NUM_CLASSES, HIDDEN_SIZE, NUM_LAYERS, NUM_HEADS, DROPOUT, SEQUENCE_LENGTH
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -13,7 +16,7 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe.unsqueeze(0))
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         return x + self.pe[:, :x.size(1), :]
 
 
@@ -38,9 +41,11 @@ class SignLanguageTransformer(nn.Module):
             nn.Linear(64, NUM_CLASSES)
         )
 
-    def forward(self, x, src_key_padding_mask=None):
+
+    def forward(self, x: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
         x = self.embedding(x)
         x = self.pos_encoder(x)
+
         output = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
 
         if src_key_padding_mask is not None:

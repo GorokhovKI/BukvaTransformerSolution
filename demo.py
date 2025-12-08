@@ -68,7 +68,7 @@ def draw_interface_pil(img_cv2, text_pred, conf, subtitles, font_ui, font_sub):
     draw.rectangle([(0, 0), (350, 60)], fill=(0, 0, 0, 200))
 
     color_ui = (0, 255, 0) if conf > CONFIDENCE_THRESH else (255, 255, 0)
-    ui_text = f"Жест: {text_pred} ({conf:.2f})"
+    ui_text = f"Geasture: {text_pred} ({conf:.2f})"
     draw.text((10, 15), ui_text, font=font_ui, fill=color_ui)
 
     sub_height = 80
@@ -118,7 +118,7 @@ def run_demo():
 
     sub_manager = SubtitleManager()
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     buffer = deque(maxlen=SEQUENCE_LENGTH)
 
     current_pred_text = "..."
