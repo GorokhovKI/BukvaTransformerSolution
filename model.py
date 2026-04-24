@@ -1,58 +1,144 @@
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
-import math
 from torch import Tensor
-from typing import Optional
-from constants import INPUT_SIZE, NUM_CLASSES, HIDDEN_SIZE, NUM_LAYERS, NUM_HEADS, DROPOUT, SEQUENCE_LENGTH
+
+from constants import (
+    DROPOUT,
+    HIDDEN_SIZE,
+    INPUT_SIZE,
+    NUM_CLASSES,
+    NUM_HEADS,
+    NUM_LAYERS,
+    SEQUENCE_LENGTH,
+)
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+@dataclass(frozen=True)
+class ModelConfig:
+    """Configuration for the sign language model."""
+
+    input_size: int = INPUT_SIZE
+    sequence_length: int = SEQUENCE_LENGTH
+    hidden_size: int = HIDDEN_SIZE
+    num_heads: int = NUM_HEADS
+    num_layers: int = NUM_LAYERS
+    dropout: float = DROPOUT
+    num_classes: int = NUM_CLASSES
+    ff_multiplier: int = 2
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Deterministic positional encoding with zero runtime allocations."""
+
+    def __init__(self, hidden_size: int, max_len: int) -> None:
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        position = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, hidden_size, 2, dtype=torch.float32)
+            * (-torch.log(torch.tensor(10000.0)) / hidden_size)
+        )
+
+        pe = torch.zeros(max_len, hidden_size, dtype=torch.float32)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
+
+        self.register_buffer("encoding", pe.unsqueeze(0), persistent=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return x + self.pe[:, :x.size(1), :]
+        return x + self.encoding[:, : x.size(1)]
+
+
+class TransformerBlock(nn.Module):
+    """Transformer encoder block with explicit residual paths."""
+
+    def __init__(self, hidden_size: int, num_heads: int, ff_size: int, dropout: float) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_size, ff_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_size, hidden_size),
+        )
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor, padding_mask: Optional[Tensor] = None) -> Tensor:
+        attn_input = self.norm1(x)
+        attn_output, _ = self.attention(
+            attn_input,
+            attn_input,
+            attn_input,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )
+        x = x + self.dropout1(attn_output)
+
+        ff_input = self.norm2(x)
+        ff_output = self.feed_forward(ff_input)
+        return x + self.dropout2(ff_output)
 
 
 class SignLanguageTransformer(nn.Module):
-    def __init__(self):
+    """Compact transformer classifier optimized for edge/mobile deployment."""
+
+    def __init__(self, config: Optional[ModelConfig] = None) -> None:
         super().__init__()
-        self.embedding = nn.Linear(INPUT_SIZE, HIDDEN_SIZE)
-        self.pos_encoder = PositionalEncoding(HIDDEN_SIZE, max_len=SEQUENCE_LENGTH + 50)
+        self.config = config or ModelConfig()
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=HIDDEN_SIZE,
-            nhead=NUM_HEADS,
-            dim_feedforward=HIDDEN_SIZE * 2,
-            dropout=DROPOUT,
-            batch_first=True
+        self.input_projection = nn.Linear(self.config.input_size, self.config.hidden_size)
+        self.position = SinusoidalPositionalEncoding(
+            hidden_size=self.config.hidden_size,
+            max_len=self.config.sequence_length + 32,
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=NUM_LAYERS)
 
-        self.fc = nn.Sequential(
-            nn.Linear(HIDDEN_SIZE, 64),
+        ff_size = self.config.hidden_size * self.config.ff_multiplier
+        self.encoder = nn.ModuleList(
+            [
+                TransformerBlock(
+                    hidden_size=self.config.hidden_size,
+                    num_heads=self.config.num_heads,
+                    ff_size=ff_size,
+                    dropout=self.config.dropout,
+                )
+                for _ in range(self.config.num_layers)
+            ]
+        )
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.config.hidden_size),
+            nn.Linear(self.config.hidden_size, 64),
             nn.ReLU(),
-            nn.Linear(64, NUM_CLASSES)
+            nn.Linear(64, self.config.num_classes),
         )
 
+    @staticmethod
+    def masked_mean_pool(sequence: Tensor, padding_mask: Optional[Tensor]) -> Tensor:
+        if padding_mask is None:
+            return sequence.mean(dim=1)
+
+        valid = (~padding_mask).to(dtype=sequence.dtype).unsqueeze(-1)
+        summed = (sequence * valid).sum(dim=1)
+        denom = valid.sum(dim=1).clamp_min(1e-6)
+        return summed / denom
 
     def forward(self, x: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
-        x = self.embedding(x)
-        x = self.pos_encoder(x)
+        x = self.input_projection(x)
+        x = self.position(x)
 
-        output = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
+        for block in self.encoder:
+            x = block(x, padding_mask=src_key_padding_mask)
 
-        if src_key_padding_mask is not None:
-            mask_float = (~src_key_padding_mask).float().unsqueeze(-1)
-            output = output * mask_float
-            output = output.sum(dim=1) / mask_float.sum(dim=1).clamp(min=1e-9)
-        else:
-            output = output.mean(dim=1)
-
-        return self.fc(output)
+        pooled = self.masked_mean_pool(x, src_key_padding_mask)
+        return self.head(pooled)
