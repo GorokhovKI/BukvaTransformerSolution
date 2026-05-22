@@ -118,7 +118,7 @@ class TransformerBlock(nn.Module):
 
 
 class SignLanguageTransformer(nn.Module):
-    """Transformer with temporal stem + CLS pooling for higher gesture accuracy."""
+    """Transformer with temporal stem + CLS pooling for gesture classification."""
 
     def __init__(self, config: Optional[ModelConfig] = None) -> None:
         super().__init__()
@@ -132,9 +132,14 @@ class SignLanguageTransformer(nn.Module):
         )
         self.position = SinusoidalPositionalEncoding(
             hidden_size=self.config.hidden_size,
-            max_len=self.config.sequence_length + 64,
+            max_len=self.config.sequence_length + 1,  # +1 для CLS-токена
         )
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.config.hidden_size))
+
+        # CLS-токен инициализируется малым нормальным шумом вместо нулей —
+        # нулевая инициализация даёт симметричный градиент через все головы
+        # внимания и замедляет специализацию CLS-позиции в первые эпохи.
+        self.cls_token = nn.Parameter(torch.empty(1, 1, self.config.hidden_size))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
 
         ff_size = self.config.hidden_size * self.config.ff_multiplier
         self.encoder = nn.ModuleList(
@@ -172,5 +177,4 @@ class SignLanguageTransformer(nn.Module):
         for block in self.encoder:
             x = block(x, padding_mask=src_key_padding_mask)
 
-        pooled = x[:, 0]
-        return self.head(pooled)
+        return self.head(x[:, 0])
