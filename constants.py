@@ -21,7 +21,7 @@ NUM_HEADS = 4
 DROPOUT = 0.3
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
-EPOCHS = 100
+EPOCHS = 150
 
 TRIMMED_VIDEOS_DIR = "data/trimmed/"
 ANNOTATIONS_PATH = "data/annotations.tsv"
