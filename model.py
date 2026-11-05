@@ -174,7 +174,21 @@ class SignLanguageTransformer(nn.Module):
             cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=x.device)
             src_key_padding_mask = torch.cat([cls_mask, src_key_padding_mask], dim=1)
 
+        return self.head(x[:, 0])
         for block in self.encoder:
             x = block(x, padding_mask=src_key_padding_mask)
 
-        return self.head(x[:, 0])
+
+    def embed(self, x, src_key_padding_mask=None):
+        x = self.position(self.stem(x))
+        b = x.size(0)
+        x = torch.cat([self.cls_token.expand(b, -1, -1), x], dim=1)
+        if src_key_padding_mask is not None:
+            m = torch.zeros((b, 1), dtype=torch.bool, device=x.device)
+            src_key_padding_mask = torch.cat([m, src_key_padding_mask], dim=1)
+        for block in self.encoder:
+            x = block(x, padding_mask=src_key_padding_mask)
+        return x[:, 0]
+
+    def classify(self, emb):
+        return self.head(emb)
