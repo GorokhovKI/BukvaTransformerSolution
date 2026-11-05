@@ -146,8 +146,10 @@ class SignLanguageTransformer(nn.Module):
         # Индекс 0 = <unk> (неизвестный/новый пользователь). user_dim=0 отключает фичу.
         self.user_embedding = None
         if self.config.user_dim > 0:
-            self.user_embedding = nn.Embedding(self.config.user_dim, self.config.hidden_size)
-            nn.init.normal_(self.user_embedding.weight, std=0.02)
+            # padding_idx=0: <unk> всегда даёт нулевой вклад (= базовая модель без user-cond)
+            # и не обучается, чтобы неизвестные пользователи не получали случайный сдвиг.
+            self.user_embedding = nn.Embedding(self.config.user_dim, self.config.hidden_size, padding_idx=0)
+            nn.init.normal_(self.user_embedding.weight[1:], std=0.02)
 
         ff_size = self.config.hidden_size * self.config.ff_multiplier
         self.encoder = nn.ModuleList(

@@ -156,9 +156,10 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
 4. **Энкодер**: 2 блока `TransformerBlock` (`MultiheadAttention` + FFN `hidden→4·hidden→hidden`, pre-norm).
 5. **Голова**: `LayerNorm → Linear(128→128) → GELU → Dropout → Linear(128→33)`.
 6. Классификация по позиции CLS (`x[:, 0]`).
-7. **User-cond** (опционально, `ModelConfig.user_dim>0`): `Embedding(user_dim, 128)` — обучаемый
-   эмбеддинг пользователя, прибавляется к CLS-токену перед энкодером (`_prepend_cls`).
-   Индекс 0 = `<unk>` (неизвестный/новый пользователь); `user_idx=None` ⇒ `<unk>`.
+7. **User-cond** (опционально, `ModelConfig.user_dim>0`): `Embedding(user_dim, 128, padding_idx=0)` —
+   обучаемый эмбеддинг пользователя, прибавляется к CLS-токену перед энкодером (`_prepend_cls`).
+   Индекс 0 = `<unk>` (`padding_idx=0` — нулевой вклад и не обучается ⇒ для неизвестных поведение = базовой
+   модели; инициализация только строк 1..), `user_idx=None` ⇒ `<unk>`.
    `user_dim=0` — эмбеддинга нет, поведение/чекпойнты побайтово совместимы с базовой моделью.
 
 Гиперпараметры (`constants.py`):
