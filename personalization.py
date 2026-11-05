@@ -1,12 +1,13 @@
-import json
+from collections import deque
 from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from constants import NUM_CLASSES, HIDDEN_SIZE, INPUT_SIZE
+from constants import NUM_CLASSES, HIDDEN_SIZE, INPUT_SIZE, SEQUENCE_LENGTH
 
 PROFILES_DIR = Path("profiles")
+BUFFER_MAXLEN = 200
 
 
 class UserAdapter(nn.Module):
@@ -28,12 +29,33 @@ class PersonalizedModel:
         self.device = device
         self.adapter = UserAdapter().to(device)
         self.feat_mean = np.zeros(INPUT_SIZE, np.float32)
-        self.buffer = []  # (seq[T,F], label) для дообучения
+        self.buffer = deque(maxlen=BUFFER_MAXLEN)  # (seq[T,F], label) для дообучения
+
+    def _to_window(self, seq):
+        """Приводит последовательность к окну [1, SEQUENCE_LENGTH, F] + маска.
+
+        Как SignDataset: длинные — center-crop, короткие — pad справа, паддинг в маске.
+        """
+        seq = self._norm(seq)
+        n = seq.shape[0]
+        if n > SEQUENCE_LENGTH:
+            start = (n - SEQUENCE_LENGTH) // 2
+            seq = seq[start: start + SEQUENCE_LENGTH]
+            mask = np.zeros(SEQUENCE_LENGTH, dtype=bool)
+        else:
+            seq = np.pad(seq, ((0, SEQUENCE_LENGTH - n), (0, 0)), mode="constant")
+            mask = np.concatenate([
+                np.zeros(n, dtype=bool),
+                np.ones(SEQUENCE_LENGTH - n, dtype=bool),
+            ])
+        x = torch.from_numpy(seq).float().unsqueeze(0).to(self.device)
+        m = torch.from_numpy(mask).bool().unsqueeze(0).to(self.device)
+        return x, m
 
     @torch.no_grad()
     def predict_logits(self, seq):
-        x = torch.from_numpy(self._norm(seq)).float().unsqueeze(0).to(self.device)
-        emb = self.base.embed(x)
+        x, mask = self._to_window(seq)
+        emb = self.base.embed(x, src_key_padding_mask=mask)
         return self.base.classify(self.adapter(emb)) + self.adapter.bias
 
     def _norm(self, seq):
@@ -44,8 +66,12 @@ class PersonalizedModel:
 
     def calibrate_features(self, seqs):
         # среднее смещение признаков человека относительно "эталона" (0)
-        frames = np.concatenate([s[s.any(axis=1)] for s in seqs])
-        self.feat_mean = (frames.mean(0) * 0.5).astype(np.float32)  # 0.5 = демпфирование
+        frames = [s[s.any(axis=1)] for s in seqs]
+        frames = [f for f in frames if len(f) > 0]
+        if not frames:
+            return
+        all_frames = np.concatenate(frames)
+        self.feat_mean = (all_frames.mean(0) * 0.5).astype(np.float32)  # 0.5 = демпфирование
 
     def add_sample(self, seq, label_idx):
         self.buffer.append((np.asarray(seq, np.float32), label_idx))
@@ -53,10 +79,12 @@ class PersonalizedModel:
     def fit(self, steps=30, lr=1e-3, l2=1e-2, batch=16):
         if len(self.buffer) < 5:
             return
-        X = torch.from_numpy(np.stack([self._norm(s) for s, _ in self.buffer])).float().to(self.device)
+        windows = [self._to_window(seq) for seq, _ in self.buffer]
+        X = torch.cat([x for x, _ in windows], dim=0)
+        mask = torch.cat([m for _, m in windows], dim=0)
         y = torch.tensor([l for _, l in self.buffer], device=self.device)
         with torch.no_grad():
-            emb = self.base.embed(X)  # база заморожена: эмбеддинги считаем один раз
+            emb = self.base.embed(X, src_key_padding_mask=mask)  # база заморожена: эмбеддинги считаем один раз
         params = list(self.adapter.parameters())
         opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
         self.adapter.train()
@@ -73,8 +101,10 @@ class PersonalizedModel:
         torch.save(self.adapter.state_dict(), PROFILES_DIR / f"{user}.pt")
         np.save(PROFILES_DIR / f"{user}_mean.npy", self.feat_mean)
 
-    def load(self, user):
+    def load(self, user) -> bool:
         p = PROFILES_DIR / f"{user}.pt"
         if p.exists():
-            self.adapter.load_state_dict(torch.load(p, map_location=self.device))
+            self.adapter.load_state_dict(torch.load(p, map_location=self.device, weights_only=True))
             self.feat_mean = np.load(PROFILES_DIR / f"{user}_mean.npy")
+            return True
+        return False

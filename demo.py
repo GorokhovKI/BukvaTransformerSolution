@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import cv2
@@ -9,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 from model import SignLanguageTransformer
 from constants import *
 from preprocess import normalize_landmarks
+from personalization import PersonalizedModel
 
 STABILITY_FRAMES = 40
 CONFIDENCE_THRESH = 0.70
@@ -95,6 +97,9 @@ def draw_interface_pil(img_cv2, text_pred, conf, subtitles, font_ui, font_sub):
 
 
 def run_demo():
+    parser = argparse.ArgumentParser(description="Демо распознавания жестов")
+    parser.add_argument("--user", default=None, help="имя профиля адаптации (например: alice)")
+    args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Загрузка модели на {device}...")
     model = SignLanguageTransformer().to(device)
@@ -102,12 +107,20 @@ def run_demo():
         print(f"Ошибка: Файл {CHECKPOINT_PATH} не найден.")
         return
     try:
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)  # чекпойнт содержит ModelConfig
         model.load_state_dict(checkpoint['model_state_dict'])
     except Exception as e:
         print(f"Ошибка весов: {e}")
         return
     model.eval()
+
+    # Персональная адаптация: identity-старт = поведение базы до первого fit
+    pm = PersonalizedModel(model, device) if args.user else None
+    new_since_fit = 0
+    if pm is not None:
+        has_profile = pm.load(args.user)
+        print(f"Адаптация: профиль '{args.user}' {'загружен' if has_profile else 'создан (новый)'}")
+        print("F - Подтвердить текущую букву как образец")
 
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(max_num_hands=NUM_HANDS, min_detection_confidence=0.7, min_tracking_confidence=0.5)
@@ -169,14 +182,20 @@ def run_demo():
             tensor = torch.FloatTensor(data).unsqueeze(0).to(device)
 
             with torch.no_grad():
-                out = model(tensor)
+                out = pm.predict_logits(data) if pm is not None else model(tensor)
                 probs = torch.softmax(out, dim=1)
                 max_prob, idx = torch.max(probs, 1)
 
                 current_conf = max_prob.item()
                 current_pred_text = IDX_TO_CLASS[idx.item()]
 
+                was_committed = sub_manager.is_committed
                 sub_manager.update(current_pred_text, current_conf)
+                committed_now = sub_manager.is_committed and not was_committed
+                if pm is not None and committed_now and current_conf >= 0.9:
+                    # псевдо-лейбл: уверенная фиксация буквы — образец для адаптации
+                    pm.add_sample(data.copy(), idx.item())
+                    new_since_fit += 1
 
         frame = draw_interface_pil(
             frame,
@@ -198,6 +217,16 @@ def run_demo():
             sub_manager.backspace()
         elif key == ord('c') or key == ord('с'):
             sub_manager.clear()
+        elif key == ord('f') and pm is not None and current_conf > 0:
+            # пользователь подтверждает: текущее окно = образец показанной буквы
+            pm.add_sample(data.copy(), idx.item())
+            new_since_fit += 1
+
+        if pm is not None and len(pm.buffer) >= 10 and new_since_fit >= 5:
+            pm.fit()
+            pm.save(args.user)
+            new_since_fit = 0
+            print(f"Адаптация: профиль обновлён ({len(pm.buffer)} образцов)")
 
     cap.release()
     cv2.destroyAllWindows()
