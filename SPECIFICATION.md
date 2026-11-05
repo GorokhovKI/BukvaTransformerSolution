@@ -96,12 +96,19 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
 - Проверка эквивалентности PyTorch↔ONNX через `onnxruntime` (top-1 класс и max |Δlogits|).
 - Пишет `rsl_dactyl_config.json` (input/output имена, форма, классы, параметры нормализации).
 
-### 3.5 `personalization.py` — персональная адаптация
-- Базовая модель замораживается. `UserAdapter`: `down(128→16) → GELU → up(16→128)` (инициализация up в 0)
-  + обучаемый `bias` размера 33. Residual: `emb + adapter(emb)`, logits = `classify(...) + bias`.
-- Калибровка признаков: `feat_mean` = среднее смещение кадров пользователя ×0.5 (демпфирование).
-- `fit()`: адаптер обучается на буфере сэмплов (AdamW lr=1e-3, L2-якорь 1e-2, label_smoothing 0.1).
-- Профили: `profiles/<user>.pt` + `profiles/<user>_mean.npy`.
+### 3.5 `personalization.py` — персональная адаптация (ветка `user-adaptation`)
+- База замораживается. `UserAdapter`: `down(128→16) → GELU → up(16→128)` (zero-init up-ветки ⇒
+  identity-старт: без профиля поведение = базе) + обучаемый `bias(33)`.
+  Residual: `emb + adapter(emb)`, logits = `classify(...) + bias`.
+- `_to_window()`: любая последовательность → окно 80 кадров (center-crop/pad) + padding-маска;
+  используется в `predict_logits()` и `fit()`.
+- `fit()`: AdamW lr=1e-3, L2-якорь 1e-2, label_smoothing 0.1, 30 шагов. Буфер `deque(maxlen=200)`.
+- `load()` → bool. Профили: `profiles/<user>.pt` + `profiles/<user>_mean.npy`.
+- Калибровка (`feat_mean`) реализована, но НЕ вызывается: измеренно вредит (−3 п.п., см. PLAN_ADAPTIVITY.md).
+- `demo.py --user <имя>`: псевдо-лейблы (conf ≥ 0.9 при фиксации буквы), клавиша F — ручное
+  подтверждение образца, refit каждые 5 сэмплов, автосохранение профиля.
+- Измерено (test-сплит, K=5): база 0.904 vs адаптер 0.902 — нейтрально.
+  Детали: `PLAN_ADAPTIVITY.md`, `REPORT_ADAPTIVITY.md`; измерение — `eval_adaptation.py`.
 
 ### 3.6 `model_adapter.py` — мобильный экспорт
 - `torch.jit.script` + `mobile_optimizer.optimize_for_mobile` → `.ptl` (Lite Interpreter).
@@ -202,10 +209,12 @@ ff_multiplier=4  temporal_kernel_size=5
 - Пути/константы частично в `constants.py`, частично захардкожены в модулях (напр. `CHECKPOINT_PATH`
   в `model_adapter.py`, `demo.py`).
 
-### 7.4 `personalization.py` — незавершённые места
-- `PersonalizedModel.load()` не возвращает признак успеха/ошибки, если профиля нет.
-- Нет CLI/точки входа `if __name__ == "__main__"` — модуль только импортируется.
-- `json` импортирован, но не используется.
+### 7.4 `personalization.py` — ограничения (замерено)
+- Few-shot адаптация (5 сэмплов) на официальном test-сплите нейтральна: 0.902 vs база 0.904.
+- Калибровка признаков вредит (−3 п.п.) — не вызывается в demo.
+- Практическая ценность — накопление сэмплов между сессиями и ручная коррекция (клавиша F),
+  чего test-метрика не моделирует.
+- Следующий шаг к гарантированному росту метрики — user-условная модель: `PLAN_USER_CONDITIONED.md`.
 
 ### 7.5 Требования неполны
 `requirements.txt` не включает `onnx`, `onnxruntime`, `scikit-learn`, `seaborn` — они нужны
