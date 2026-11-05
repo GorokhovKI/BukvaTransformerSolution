@@ -102,17 +102,24 @@ def run_demo():
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Загрузка модели на {device}...")
-    model = SignLanguageTransformer().to(device)
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"Ошибка: Файл {CHECKPOINT_PATH} не найден.")
         return
     try:
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)  # чекпойнт содержит ModelConfig
+        model = SignLanguageTransformer(checkpoint.get("model_config")).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
     except Exception as e:
         print(f"Ошибка весов: {e}")
         return
     model.eval()
+
+    if model.config.input_size != INPUT_SIZE:
+        print(
+            f"Ошибка: чекпойнт обучен под input_size={model.config.input_size} (две руки), "
+            f"а предобработка теперь выдаёт {INPUT_SIZE} (одна рука). Переобучите модель: python train.py"
+        )
+        return
 
     # User-cond: известный пользователь -> его эмбеддинг; иначе <unk> (или фича отсутствует)
     user_idx = None
@@ -135,7 +142,7 @@ def run_demo():
         print("F - Подтвердить текущую букву как образец")
 
     mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(max_num_hands=NUM_HANDS, min_detection_confidence=0.7, min_tracking_confidence=0.5)
+    hands = mp_hands.Hands(max_num_hands=MAX_TRACKED_HANDS, min_detection_confidence=0.7, min_tracking_confidence=0.5)
     mp_draw = mp.solutions.drawing_utils
 
     font_ui = get_font(32)
@@ -163,19 +170,26 @@ def run_demo():
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb)
 
-        features_frame = np.zeros((NUM_HANDS, NUM_LANDMARKS, 3))
+        features_frame = np.zeros(INPUT_SIZE, dtype=np.float32)
         has_hands = False
 
         if results.multi_hand_landmarks:
             has_hands = True
-            for idx, lms in enumerate(results.multi_hand_landmarks):
-                if idx >= NUM_HANDS: break
+            handedness = results.multi_handedness or []
+            best_feat = None
+            for i, lms in enumerate(results.multi_hand_landmarks):
                 mp_draw.draw_landmarks(frame, lms, mp_hands.HAND_CONNECTIONS)
-                norm = normalize_landmarks(lms.landmark)
-                features_frame[idx] = norm.reshape(NUM_LANDMARKS, 3)
+                label = "Right"
+                if i < len(handedness) and handedness[i].classification:
+                    label = handedness[i].classification[0].label
+                feat = normalize_landmarks(lms.landmark, mirror_x=(label == "Left"))
+                # предпочитаем каноническую правую руку
+                if best_feat is None or label == "Right":
+                    best_feat = feat
+            features_frame = best_feat
 
         if has_hands:
-            buffer.append(features_frame.flatten())
+            buffer.append(features_frame)
         else:
             if len(buffer) > 0:
                 buffer.append(np.zeros(INPUT_SIZE))

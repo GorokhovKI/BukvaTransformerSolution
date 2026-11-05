@@ -12,7 +12,10 @@ NUM_CLASSES = len(CLASSES)
 
 SEQUENCE_LENGTH = 80
 NUM_LANDMARKS = 21
-NUM_HANDS = 2
+# Дактильная азбука — одноручная (кисть правой руки). Вход модели — одна рука.
+NUM_HANDS = 1
+# MediaPipe отслеживает до 2 рук, чтобы выбрать активную (жестикулирующую).
+MAX_TRACKED_HANDS = 2
 INPUT_SIZE = NUM_HANDS * NUM_LANDMARKS * 3
 
 HIDDEN_SIZE = 128

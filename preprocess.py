@@ -12,13 +12,13 @@ from constants import (
     ANNOTATIONS_PATH,
     CLASS_TO_IDX,
     FEATURES_DIR,
-    NUM_HANDS,
+    MAX_TRACKED_HANDS,
     NUM_LANDMARKS,
     TRIMMED_VIDEOS_DIR,
 )
 
 
-def normalize_landmarks(landmarks) -> np.ndarray:
+def normalize_landmarks(landmarks, mirror_x: bool = False) -> np.ndarray:
     coords = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32)
     wrist = coords[0]
     centered = coords - wrist
@@ -26,15 +26,33 @@ def normalize_landmarks(landmarks) -> np.ndarray:
     if scale < 1e-6:
         scale = 1.0
     normalized = centered / scale
+    if mirror_x:
+        # каноническая ПРАВАЯ рука: левую зеркалим по x
+        normalized[:, 0] = -normalized[:, 0]
     return np.clip(normalized, -5.0, 5.0).flatten()
 
 
+def _motion(entries: list[tuple[int, np.ndarray]]) -> float:
+    """Мера активности руки — суммарное изменение между последовательными
+    обнаруженными кадрами. Жестикулирующая рука меняет конфигурацию пальцев,
+    покоящаяся — нет. <2 кадров → -1 (нет данных)."""
+    if len(entries) < 2:
+        return -1.0
+    return sum(float(np.abs(f1 - f0).sum()) for (_, f0), (_, f1) in zip(entries, entries[1:]))
+
+
 def process_video(video_path: Path) -> np.ndarray | None:
-    """Обрабатывает одно видео, создавая отдельный экземпляр Hands на каждый вызов."""
+    """Обрабатывает одно видео в одну каноническую (правую) руку.
+
+    Дактиль одноручный: отслеживаем до MAX_TRACKED_HANDS рук, выбираем активную
+    (с максимальным межкадровым движением), левую руку зеркалим к правой.
+    Кадры без выбранной руки заполняются нулями (как в demo) — временная
+    структура сохраняется, что важно для динамических букв (Ё, Й).
+    """
     mp_hands = mp.solutions.hands
     with mp_hands.Hands(
         static_image_mode=False,
-        max_num_hands=NUM_HANDS,
+        max_num_hands=MAX_TRACKED_HANDS,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ) as hands:
@@ -42,33 +60,50 @@ def process_video(video_path: Path) -> np.ndarray | None:
         if not cap.isOpened():
             return None
 
-        frames_data = []
+        # ключ = label руки, значение = [(номер_кадра, канонические_признаки), ...]
+        detected: dict[str, list[tuple[int, np.ndarray]]] = {}
+        frame_idx = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # selfie-ориентация как в demo.py — иначе MediaPipe путает Left/Right
+            frame_rgb = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
             results = hands.process(frame_rgb)
 
-            frame_features = np.zeros((NUM_HANDS, NUM_LANDMARKS, 3), dtype=np.float32)
             if results.multi_hand_landmarks:
-                for idx, landmarks in enumerate(results.multi_hand_landmarks):
-                    if idx >= NUM_HANDS:
-                        break
-                    norm_lm = normalize_landmarks(landmarks.landmark)
-                    frame_features[idx] = norm_lm.reshape(NUM_LANDMARKS, 3)
-
-            frames_data.append(frame_features.flatten())
+                seen: set[str] = set()
+                handedness = results.multi_handedness or []
+                for i, lms in enumerate(results.multi_hand_landmarks):
+                    label = "Right"
+                    if i < len(handedness) and handedness[i].classification:
+                        label = handedness[i].classification[0].label
+                    if label in seen:
+                        continue
+                    seen.add(label)
+                    feat = normalize_landmarks(lms.landmark, mirror_x=(label == "Left"))
+                    detected.setdefault(label, []).append((frame_idx, feat))
+            frame_idx += 1
         cap.release()
 
-    if not frames_data:
+    if not detected or frame_idx == 0:
         return None
 
-    features = np.array(frames_data, dtype=np.float32)
+    # Активная рука — максимум движения; при равенстве — правая, затем больше кадров.
+    def key(label: str) -> tuple[float, int, int]:
+        entries = detected[label]
+        return (_motion(entries), 1 if label == "Right" else 0, len(entries))
+    best_label = max(detected, key=key)
+
+    # Восстанавливаем временную структуру: нули там, где выбранной руки нет.
+    by_frame = {i: f for i, f in detected[best_label]}
+    features = np.array(
+        [by_frame.get(i, np.zeros(NUM_LANDMARKS * 3, dtype=np.float32)) for i in range(frame_idx)],
+        dtype=np.float32,
+    )
 
     # Фильтрация видео с >50% нулевых кадров (рука не обнаружена)
-    empty_ratio = (features.sum(axis=1) == 0).mean()
-    if empty_ratio > 0.5:
+    if (features.sum(axis=1) == 0).mean() > 0.5:
         return None
 
     return features
