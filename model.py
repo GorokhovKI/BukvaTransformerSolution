@@ -27,6 +27,7 @@ class ModelConfig:
     num_classes: int = NUM_CLASSES
     ff_multiplier: int = 4
     temporal_kernel_size: int = 5
+    user_dim: int = 0  # строк в таблице user-эмбеддингов: N_users + 1 (<unk> на индексе 0). 0 = без обусловленности
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -141,6 +142,13 @@ class SignLanguageTransformer(nn.Module):
         self.cls_token = nn.Parameter(torch.empty(1, 1, self.config.hidden_size))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
+        # Пер-пользовательская обусловленность: user_id -> эмбеддинг, прибавляется к CLS.
+        # Индекс 0 = <unk> (неизвестный/новый пользователь). user_dim=0 отключает фичу.
+        self.user_embedding = None
+        if self.config.user_dim > 0:
+            self.user_embedding = nn.Embedding(self.config.user_dim, self.config.hidden_size)
+            nn.init.normal_(self.user_embedding.weight, std=0.02)
+
         ff_size = self.config.hidden_size * self.config.ff_multiplier
         self.encoder = nn.ModuleList(
             [
@@ -162,31 +170,43 @@ class SignLanguageTransformer(nn.Module):
             nn.Linear(128, self.config.num_classes),
         )
 
-    def forward(self, x: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
-        x = self.stem(x)
-        x = self.position(x)
-
-        batch_size = x.size(0)
-        cls = self.cls_token.expand(batch_size, -1, -1)
+    def _prepend_cls(
+        self,
+        x: Tensor,
+        src_key_padding_mask: Optional[Tensor] = None,
+        user_idx: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        b = x.size(0)
+        cls = self.cls_token.expand(b, -1, -1)
+        if self.user_embedding is not None:
+            if user_idx is None:
+                user_idx = torch.zeros(b, dtype=torch.long, device=x.device)  # <unk>
+            cls = cls + self.user_embedding(user_idx.to(x.device)).unsqueeze(1)
         x = torch.cat([cls, x], dim=1)
 
         if src_key_padding_mask is not None:
-            cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=x.device)
+            cls_mask = torch.zeros((b, 1), dtype=torch.bool, device=x.device)
             src_key_padding_mask = torch.cat([cls_mask, src_key_padding_mask], dim=1)
+        return x, src_key_padding_mask
+
+    def forward(
+        self,
+        x: Tensor,
+        src_key_padding_mask: Optional[Tensor] = None,
+        user_idx: Optional[Tensor] = None,
+    ) -> Tensor:
+        x = self.stem(x)
+        x = self.position(x)
+        x, src_key_padding_mask = self._prepend_cls(x, src_key_padding_mask, user_idx)
 
         for block in self.encoder:
             x = block(x, padding_mask=src_key_padding_mask)
 
         return self.head(x[:, 0])
 
-
-    def embed(self, x, src_key_padding_mask=None):
+    def embed(self, x, src_key_padding_mask=None, user_idx=None):
         x = self.position(self.stem(x))
-        b = x.size(0)
-        x = torch.cat([self.cls_token.expand(b, -1, -1), x], dim=1)
-        if src_key_padding_mask is not None:
-            m = torch.zeros((b, 1), dtype=torch.bool, device=x.device)
-            src_key_padding_mask = torch.cat([m, src_key_padding_mask], dim=1)
+        x, src_key_padding_mask = self._prepend_cls(x, src_key_padding_mask, user_idx)
         for block in self.encoder:
             x = block(x, padding_mask=src_key_padding_mask)
         return x[:, 0]

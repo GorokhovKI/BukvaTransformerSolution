@@ -114,8 +114,20 @@ def run_demo():
         return
     model.eval()
 
+    # User-cond: известный пользователь -> его эмбеддинг; иначе <unk> (или фича отсутствует)
+    user_idx = None
+    vocab = checkpoint.get("user_vocab") or {}
+    if args.user and model.config.user_dim > 0:
+        if args.user in vocab:
+            user_idx = torch.tensor([vocab[args.user]], device=device)
+            print(f"User-cond: '{args.user}' — известный пользователь (idx {vocab[args.user]})")
+        else:
+            print(f"User-cond: '{args.user}' нет в словаре модели — <unk> (адаптер может дообучиться)")
+
     # Персональная адаптация: identity-старт = поведение базы до первого fit
     pm = PersonalizedModel(model, device) if args.user else None
+    if pm is not None:
+        pm.user_idx = user_idx
     new_since_fit = 0
     if pm is not None:
         has_profile = pm.load(args.user)
@@ -182,7 +194,7 @@ def run_demo():
             tensor = torch.FloatTensor(data).unsqueeze(0).to(device)
 
             with torch.no_grad():
-                out = pm.predict_logits(data) if pm is not None else model(tensor)
+                out = pm.predict_logits(data) if pm is not None else model(tensor, user_idx=user_idx)
                 probs = torch.softmax(out, dim=1)
                 max_prob, idx = torch.max(probs, 1)
 

@@ -72,13 +72,18 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
 
 ### 3.2 `train.py` — обучение
 - `SignDataset`: загрузка `.npy`, аугментация (гаусс-шум σ=0.005, масштаб ×[0.9, 1.1]);
-  обрезка по центру / паддинг до `SEQUENCE_LENGTH=80` + булева padding-маска.
+  обрезка по центру / паддинг до `SEQUENCE_LENGTH=80` + булева padding-маска;
+  возвращает `(features, label, mask, user_idx)`.
+- **User-условность**: словарь `user_id→idx` строится из `data/annotations.tsv` только по train-клипам
+  (`load_user_maps`); assert пересечения пользователей train/test пусто (нет утечки); train-сэмплы
+  получают `user_idx` своего пользователя, val — всегда 0 (`<unk>`, оценка обобщения на неизвестных).
+  Без annotations.tsv → `user_dim=0`, поведение как раньше.
 - Лосс: `CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)` (классовые веса через `bincount`).
 - Оптимизатор: `AdamW`, weight decay 1e-2 только для ненормирующих параметров
   (`norm`, `bias`, `cls_token` → decay 0).
 - Шедулер: `OneCycleLR` (pct_start=0.1, cos, div_factor=10, final_div_factor=100).
 - Gradient clipping: `max_norm=1.0`. Early stopping: `patience=20` по **weighted F1** на валидации.
-- Чекпойнт сохраняет: `model_state_dict, model_config, epoch, best_f1`.
+- Чекпойнт сохраняет: `model_state_dict, model_config, epoch, best_f1, user_vocab`.
 - Результаты: `results/training_history.json`, `results/evaluation_history.json`,
   `results/classification_report.txt`, 15 PNG (`plot.py`).
 
@@ -88,11 +93,15 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
 - `SubtitleManager`: буква фиксируется после `STABILITY_FRAMES=40` одинаковых предсказаний
   при уверенности `CONFIDENCE_THRESH=0.70`.
 - Управление: `Q` выход, `SPACE` пробел, `BACKSPACE` удалить символ, `C` очистить.
+- `--user <имя>`: если чекпойнт содержит `user_vocab` и имя в нём — инференс с эмбеддингом
+  этого пользователя (user-cond), иначе `<unk>` + адаптер (`personalization.py`) может дообучиться.
 
 ### 3.4 `pth_to_onnx.py` — экспорт для Unity
 - `InferenceWrapper`: вход `[1, 80, 126]`, **без padding-маски** (Unity заполняет окно
   80 реальными кадрами). Выход `[1, 33]` = logits.
 - `torch.onnx.export` opset **17**, `do_constant_folding=True`.
+- User-cond: экспорт без `user_idx` → модель сама подставляет `<unk>` (индекс 0) — ONNX
+  побайтово совместим с обоими типами чекпойнтов, изменений в `pth_to_onnx.py` не требуется.
 - Проверка эквивалентности PyTorch↔ONNX через `onnxruntime` (top-1 класс и max |Δlogits|).
 - Пишет `rsl_dactyl_config.json` (input/output имена, форма, классы, параметры нормализации).
 
@@ -109,6 +118,14 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
   подтверждение образца, refit каждые 5 сэмплов, автосохранение профиля.
 - Измерено (test-сплит, K=5): база 0.904 vs адаптер 0.902 — нейтрально.
   Детали: `PLAN_ADAPTIVITY.md`, `REPORT_ADAPTIVITY.md`; измерение — `eval_adaptation.py`.
+- `PersonalizedModel.user_idx` (None по умолчанию): пробрасывается в `embed()` базы — адаптер
+  совместим с user-условной моделью.
+
+### 3.7 `eval_user_conditioned.py` — оценка user-условной модели
+- Работает с обоими чекпойнтами: `user_dim=0` → метрики теста + подсказка; `user_dim>0` →
+  три цифры: (1) официальный test с `<unk>` — несмещённая проверка против 91.21%;
+  (2) known users: train-сэмплы cond vs `<unk>` (⚠️ завышено — сэмплы были в обучении);
+  (3) таблица по пользователям: `acc(<unk>)`, `acc(cond)`, Δ, n.
 
 ### 3.6 `model_adapter.py` — мобильный экспорт
 - `torch.jit.script` + `mobile_optimizer.optimize_for_mobile` → `.ptl` (Lite Interpreter).
@@ -129,6 +146,10 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
 4. **Энкодер**: 2 блока `TransformerBlock` (`MultiheadAttention` + FFN `hidden→4·hidden→hidden`, pre-norm).
 5. **Голова**: `LayerNorm → Linear(128→128) → GELU → Dropout → Linear(128→33)`.
 6. Классификация по позиции CLS (`x[:, 0]`).
+7. **User-cond** (опционально, `ModelConfig.user_dim>0`): `Embedding(user_dim, 128)` — обучаемый
+   эмбеддинг пользователя, прибавляется к CLS-токену перед энкодером (`_prepend_cls`).
+   Индекс 0 = `<unk>` (неизвестный/новый пользователь); `user_idx=None` ⇒ `<unk>`.
+   `user_dim=0` — эмбеддинга нет, поведение/чекпойнты побайтово совместимы с базовой моделью.
 
 Гиперпараметры (`constants.py`):
 ```
@@ -209,12 +230,15 @@ ff_multiplier=4  temporal_kernel_size=5
 - Пути/константы частично в `constants.py`, частично захардкожены в модулях (напр. `CHECKPOINT_PATH`
   в `model_adapter.py`, `demo.py`).
 
-### 7.4 `personalization.py` — ограничения (замерено)
+### 7.4 Персональная адаптация и user-условность — ограничения (замерено)
 - Few-shot адаптация (5 сэмплов) на официальном test-сплите нейтральна: 0.902 vs база 0.904.
 - Калибровка признаков вредит (−3 п.п.) — не вызывается в demo.
-- Практическая ценность — накопление сэмплов между сессиями и ручная коррекция (клавиша F),
+- Практическая ценность адаптера — накопление сэмплов между сессиями и ручная коррекция (клавиша F),
   чего test-метрика не моделирует.
-- Следующий шаг к гарантированному росту метрики — user-условная модель: `PLAN_USER_CONDITIONED.md`.
+- User-условная модель реализована кодом, но **НЕ обучена** (P2 плана): обучение `python train.py`,
+  оценка `python eval_user_conditioned.py`. Критерий приёмки: известные ≥ +1 п.п., test с `<unk>` ≥ 91.0%.
+  ⚠️ Оценка known users на train-сэмплах завышена (сэмплы были в обучении) — для несмещённой
+  цифры нужен per-user holdout при обучении (пока не реализован).
 
 ### 7.5 Требования неполны
 `requirements.txt` не включает `onnx`, `onnxruntime`, `scikit-learn`, `seaborn` — они нужны

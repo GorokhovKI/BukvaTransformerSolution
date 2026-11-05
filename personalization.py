@@ -30,6 +30,8 @@ class PersonalizedModel:
         self.adapter = UserAdapter().to(device)
         self.feat_mean = np.zeros(INPUT_SIZE, np.float32)
         self.buffer = deque(maxlen=BUFFER_MAXLEN)  # (seq[T,F], label) для дообучения
+        # тензор [1] long с индексом пользователя для user-условной модели; None = <unk>/без фичи
+        self.user_idx = None
 
     def _to_window(self, seq):
         """Приводит последовательность к окну [1, SEQUENCE_LENGTH, F] + маска.
@@ -55,7 +57,7 @@ class PersonalizedModel:
     @torch.no_grad()
     def predict_logits(self, seq):
         x, mask = self._to_window(seq)
-        emb = self.base.embed(x, src_key_padding_mask=mask)
+        emb = self.base.embed(x, src_key_padding_mask=mask, user_idx=self.user_idx)
         return self.base.classify(self.adapter(emb)) + self.adapter.bias
 
     def _norm(self, seq):
@@ -83,8 +85,9 @@ class PersonalizedModel:
         X = torch.cat([x for x, _ in windows], dim=0)
         mask = torch.cat([m for _, m in windows], dim=0)
         y = torch.tensor([l for _, l in self.buffer], device=self.device)
+        uidx = None if self.user_idx is None else self.user_idx.expand(len(y))
         with torch.no_grad():
-            emb = self.base.embed(X, src_key_padding_mask=mask)  # база заморожена: эмбеддинги считаем один раз
+            emb = self.base.embed(X, src_key_padding_mask=mask, user_idx=uidx)  # база заморожена: эмбеддинги считаем один раз
         params = list(self.adapter.parameters())
         opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
         self.adapter.train()
