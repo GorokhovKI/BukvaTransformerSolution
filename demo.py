@@ -9,7 +9,7 @@ from collections import deque
 from PIL import Image, ImageDraw, ImageFont
 from model import SignLanguageTransformer
 from constants import *
-from preprocess import normalize_landmarks
+from preprocess import _hand_features
 from personalization import PersonalizedModel
 
 STABILITY_FRAMES = 40
@@ -116,8 +116,8 @@ def run_demo():
 
     if model.config.input_size != INPUT_SIZE:
         print(
-            f"Ошибка: чекпойнт обучен под input_size={model.config.input_size} (две руки), "
-            f"а предобработка теперь выдаёт {INPUT_SIZE} (одна рука). Переобучите модель: python train.py"
+            f"Ошибка: чекпойнт обучен под input_size={model.config.input_size}, "
+            f"а предобработка выдаёт {INPUT_SIZE}. Переобучите модель: python train.py"
         )
         return
 
@@ -142,7 +142,7 @@ def run_demo():
         print("F - Подтвердить текущую букву как образец")
 
     mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(max_num_hands=MAX_TRACKED_HANDS, min_detection_confidence=0.7, min_tracking_confidence=0.5)
+    hands = mp_hands.Hands(max_num_hands=NUM_HANDS, min_detection_confidence=0.7, min_tracking_confidence=0.5)
     mp_draw = mp.solutions.drawing_utils
 
     font_ui = get_font(32)
@@ -170,23 +170,15 @@ def run_demo():
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb)
 
-        features_frame = np.zeros(INPUT_SIZE, dtype=np.float32)
+        features_frame = np.zeros((NUM_HANDS, NUM_LANDMARKS, 3), dtype=np.float32)
         has_hands = False
 
         if results.multi_hand_landmarks:
             has_hands = True
-            handedness = results.multi_handedness or []
-            best_feat = None
-            for i, lms in enumerate(results.multi_hand_landmarks):
+            for lms in results.multi_hand_landmarks:
                 mp_draw.draw_landmarks(frame, lms, mp_hands.HAND_CONNECTIONS)
-                label = "Right"
-                if i < len(handedness) and handedness[i].classification:
-                    label = handedness[i].classification[0].label
-                feat = normalize_landmarks(lms.landmark, mirror_x=(label == "Left"))
-                # предпочитаем каноническую правую руку
-                if best_feat is None or label == "Right":
-                    best_feat = feat
-            features_frame = best_feat
+            _hand_features(features_frame, results.multi_hand_landmarks)
+            features_frame = features_frame.flatten()
 
         if has_hands:
             buffer.append(features_frame)

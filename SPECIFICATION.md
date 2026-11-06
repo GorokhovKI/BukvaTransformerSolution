@@ -60,22 +60,22 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
 
 ### 3.1 `preprocess.py` — извлечение признаков
 - MediaPipe Hands (`min_detection_confidence=0.5`, `min_tracking_confidence=0.5`,
-  `max_num_hands=MAX_TRACKED_HANDS=2` — две руки отслеживаются, чтобы выбрать активную).
-- **Одноручная модель** (русский дактиль одноручный, канон — правая рука): кадр → тензор
-  `[1 рука × 21 ландмарк × 3 (x,y,z)] = 63` числа.
-- Канонизация: selfie-ориентация `cv2.flip(frame,1)` (как в demo, устраняет train/serve skew);
-  руки привязаны к Left/Right через `results.multi_handedness` (параллельный список, тот же индекс);
-  левая рука зеркалится к правой (`normalize_landmarks(..., mirror_x=True)`).
+  `max_num_hands=NUM_HANDS=2`).
+- **Два слота рук**: кадр → тензор `[2 руки × 21 ландмарк × 3 (x,y,z)] = 126` чисел.
+  Дактиль одноручный, но вторая рука часто в кадре; выбор «активной» руки по движению ошибался
+  (см. `REPORT_SINGLE_HAND.md`), поэтому слоты детерминированы: **слот 0 — самая высокая рука
+  в кадре** (в дактиле это рабочая), слот 1 — вторая (`_hand_features()`).
+- Канонизация: selfie-ориентация `cv2.flip(frame,1)` (как в demo, устраняет train/serve skew).
+  Метки `multi_handedness` для привязки/зеркалирования НЕ используются — MediaPipe путает
+  Left/Right между кадрами, что даёт скачки координат и ложное «движение».
 - Нормализация руки в `normalize_landmarks()`:
   1. центр в запястье (ландмарк 0) → `coords - wrist`;
   2. масштаб = норма вектора до ландмарка 9 (MCP среднего пальца);
   3. деление на масштаб, clip в `[-5.0, 5.0]`, flatten.
-- Выбор активной руки по максимальному межкадровому движению (`_motion`); при равенстве —
-  правая, затем больше кадров. Кадры без выбранной руки заполняются нулями — временная
-  структура сохраняется (важно для динамических Ё, Й).
-- Фильтр: видео с >50% нулевых кадров (выбранная рука не найдена) отбрасывается.
+- Кадры без рук заполняются нулями — временная структура сохраняется (важно для динамических Ё, Й).
+- Фильтр: видео с >50% нулевых кадров (рука не найдена) отбрасывается.
 - Распараллеливание: `ProcessPoolExecutor` (отдельный экземпляр `Hands` на воркер — требование MediaPipe).
-- Результат: `features_data/<id>.npy` (форма `[T, 63]`) + `features_data/metadata.npy`
+- Результат: `features_data/<id>.npy` (форма `[T, 126]`) + `features_data/metadata.npy`
   (`paths, labels, is_train, label_map`). Train-часть перемешивается, test — нет.
 
 ### 3.2 `train.py` — обучение
@@ -107,7 +107,7 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
   этого пользователя (user-cond), иначе `<unk>` + адаптер (`personalization.py`) может дообучиться.
 
 ### 3.4 `pth_to_onnx.py` — экспорт для Unity
-- `InferenceWrapper`: вход `[1, 80, 63]`, **без padding-маски** (Unity заполняет окно
+- `InferenceWrapper`: вход `[1, 80, 126]`, **без padding-маски** (Unity заполняет окно
   80 реальными кадрами). Выход `[1, 33]` = logits.
 - `torch.onnx.export` opset **17**, `do_constant_folding=True`.
 - User-cond: экспорт без `user_idx` → модель сама подставляет `<unk>` (индекс 0) — ONNX
@@ -164,13 +164,13 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
 
 Гиперпараметры (`constants.py`):
 ```
-SEQUENCE_LENGTH=80  NUM_LANDMARKS=21  NUM_HANDS=1  MAX_TRACKED_HANDS=2  INPUT_SIZE=63
+SEQUENCE_LENGTH=80  NUM_LANDMARKS=21  NUM_HANDS=2  INPUT_SIZE=126
 HIDDEN_SIZE=128  NUM_LAYERS=2  NUM_HEADS=4  DROPOUT=0.3
 BATCH_SIZE=16  LEARNING_RATE=1e-4  EPOCHS=150
 ff_multiplier=4  temporal_kernel_size=5
 ```
 
-**Размер**: 451 489 параметров ≈ **1.76 МБ** (одноручная; было 467 617 при двух руках).
+**Размер**: 467 617 параметров ≈ **1.82 МБ** (две руки).
 
 ---
 
@@ -242,15 +242,15 @@ ff_multiplier=4  temporal_kernel_size=5
 `requirements.txt` не включает `onnx`, `onnxruntime`, `scikit-learn`, `seaborn` — они нужны
 для `pth_to_onnx.py` и `plot.py`/`train.py`.
 
-### 7.6 Одноручная модель — несовместимость со старыми артефактами
-Переход на `NUM_HANDS=1` (вход 126→63) меняет `ModelConfig.input_size`:
-- Старый чекпойнт `best_model_bukva.pth` (input_size=126) **не совместим** с новой моделью —
-  `demo.py` это детектирует и требует переобучения, `pth_to_onnx.py` упадёт на shape mismatch.
-- Порядок действий для продакшена: `python preprocess.py` (перегенерировать `features_data/*.npy`
-  и `metadata.npy` под 63 признака) → `python train.py` → `eval_user_conditioned.py` → `pth_to_onnx.py`.
-- Бэкап старого чекпойнта — `best_model_bukva_base.pth` (см. NEXT_STEPS.md).
-- Старая точность 91.21% относится к ДВУХРУЧНОЙ модели; после переобучения метрику надо заново
-  зафиксировать в §5.
+### 7.6 Перегенерация признаков после смены схемы слотов
+Вход снова 126 признаков (две руки), но **порядок слотов другой**: раньше MediaPipe отдавал руки
+в произвольном порядке, теперь слот 0 — самая высокая рука. Старые `features_data/*.npy`
+непригодны (другой порядок слотов и selfie-flip):
+- Порядок: `python preprocess.py` → `python train.py` → `eval_user_conditioned.py` → `pth_to_onnx.py`.
+- Чекпойнт с `input_size=63` (одноручный эксперимент) не совместим — `demo.py` это детектирует.
+- Бэкап двухручной базовой модели — `best_model_bukva_base.pth`.
+- Метрика 91.21% относится к старой схеме слотов; одноручный эксперимент дал 80.31%
+  (разбор: `REPORT_SINGLE_HAND.md`). После переобучения зафиксировать метрику в §5.
 
 ---
 
