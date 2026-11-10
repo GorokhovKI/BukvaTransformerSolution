@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from torch.utils.data import DataLoader, Dataset
@@ -14,6 +15,7 @@ from constants import (
     CHECKPOINT_PATH,
     EPOCHS,
     FEATURES_DIR,
+    FOCAL_GAMMA,
     LEARNING_RATE,
     NUM_CLASSES,
     SEQUENCE_LENGTH,
@@ -96,10 +98,15 @@ def get_model_info(model: nn.Module) -> tuple[float, int]:
     return (param_size + buffer_size) / 1024 ** 2, sum(p.numel() for p in model.parameters())
 
 
-def build_class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
-    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
-    counts[counts == 0] = 1.0
-    return torch.tensor(counts.sum() / (num_classes * counts), dtype=torch.float32, device=device)
+def focal_loss(logits: torch.Tensor, targets: torch.Tensor, gamma: float, label_smoothing: float = 0.0) -> torch.Tensor:
+    """Focal loss: гасит уверенно-верные примеры, усиливает трудные (ошибки).
+
+    gamma=0 -> обычный CrossEntropy (с label smoothing).
+    pt = вероятность истинного класса по softmax.
+    """
+    ce = F.cross_entropy(logits, targets, label_smoothing=label_smoothing, reduction="none")
+    pt = F.softmax(logits, dim=-1).gather(1, targets.unsqueeze(1)).squeeze(1)
+    return ((1.0 - pt) ** gamma * ce).mean()
 
 
 def build_optimizer(model: nn.Module, lr: float) -> optim.AdamW:
@@ -197,8 +204,6 @@ def train_model() -> None:
     size_mb, n_params = get_model_info(model)
     print(f"Модель: {n_params/1e6:.2f} млн параметров | {size_mb:.2f} МБ | устройство: {device}")
 
-    class_weights = build_class_weights(y_train, NUM_CLASSES)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     optimizer = build_optimizer(model, LEARNING_RATE)
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -236,7 +241,7 @@ def train_model() -> None:
             x, y, mask, uidx = x.to(device), y.to(device), mask.to(device), uidx.to(device)
             optimizer.zero_grad()
             output = model(x, src_key_padding_mask=mask, user_idx=uidx)
-            loss = criterion(output, y)
+            loss = focal_loss(output, y, gamma=FOCAL_GAMMA, label_smoothing=0.1)
             loss.backward()
 
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
@@ -261,7 +266,7 @@ def train_model() -> None:
             for x, y, mask, uidx in val_loader:
                 x, y, mask, uidx = x.to(device), y.to(device), mask.to(device), uidx.to(device)
                 output = model(x, src_key_padding_mask=mask, user_idx=uidx)
-                val_loss += criterion(output, y).item()
+                val_loss += focal_loss(output, y, gamma=FOCAL_GAMMA, label_smoothing=0.1).item()
                 preds = output.argmax(dim=1)
                 val_correct += (preds == y).sum().item()
                 val_total += y.size(0)

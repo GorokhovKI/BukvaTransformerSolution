@@ -23,7 +23,10 @@ NUM_HEADS = 4
 DROPOUT = 0.3
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
-EPOCHS = 150
+EPOCHS = 90
+# Focal loss: gamma=0 = обычный CrossEntropy; gamma>0 усиливает трудные примеры
+# (уверенные ошибки вроде М<->Т), гасит лёгкие. Причина введения — REPORT_SINGLE_HAND.md §М/Т.
+FOCAL_GAMMA = 2.0
 
 TRIMMED_VIDEOS_DIR = "data/trimmed/"
 ANNOTATIONS_PATH = "data/annotations.tsv"

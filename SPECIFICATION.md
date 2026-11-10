@@ -86,7 +86,10 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
   (`load_user_maps`); assert пересечения пользователей train/test пусто (нет утечки); train-сэмплы
   получают `user_idx` своего пользователя, val — всегда 0 (`<unk>`, оценка обобщения на неизвестных).
   Без annotations.tsv → `user_dim=0`, поведение как раньше.
-- Лосс: `CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)` (классовые веса через `bincount`).
+- Лосс: **focal loss** `focal_loss(logits, targets, gamma=FOCAL_GAMMA, label_smoothing=0.1)`.
+  `gamma=0` = обычный CE; `gamma=2.0` гасит уверенно-верные примеры (`(1−pt)^γ`) и усиливает
+  уверенные ошибки (М↔Т, Л↔П) — причина введения REPORT_SINGLE_HAND.md §М/Т (статика разделяет пару
+  на 82%, а модель даёт 65%). Классовые веса убраны (на сбалансированных классах были ≈1.0, бесполезны).
 - Оптимизатор: `AdamW`, weight decay 1e-2 только для ненормирующих параметров
   (`norm`, `bias`, `cls_token` → decay 0).
 - Шедулер: `OneCycleLR` (pct_start=0.1, cos, div_factor=10, final_div_factor=100).
@@ -166,7 +169,7 @@ data/trimmed/*.mp4 ──► preprocess.py ──► features_data/*.npy + metad
 ```
 SEQUENCE_LENGTH=80  NUM_LANDMARKS=21  NUM_HANDS=2  INPUT_SIZE=126
 HIDDEN_SIZE=128  NUM_LAYERS=2  NUM_HEADS=4  DROPOUT=0.3
-BATCH_SIZE=16  LEARNING_RATE=1e-4  EPOCHS=150
+BATCH_SIZE=16  LEARNING_RATE=1e-4  EPOCHS=90  FOCAL_GAMMA=2.0
 ff_multiplier=4  temporal_kernel_size=5
 ```
 
