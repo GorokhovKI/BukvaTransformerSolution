@@ -12,6 +12,8 @@ NUM_CLASSES = len(CLASSES)
 
 SEQUENCE_LENGTH = 80
 NUM_LANDMARKS = 21
+# Вход модели — две руки: слот 0 = рука выше в кадре (в дактиле — рабочая), слот 1 = вторая.
+# Детерминированный порядок слотов убирает выбор «активной» руки и его ошибки.
 NUM_HANDS = 2
 INPUT_SIZE = NUM_HANDS * NUM_LANDMARKS * 3
 
@@ -21,7 +23,10 @@ NUM_HEADS = 4
 DROPOUT = 0.3
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
-EPOCHS = 150
+EPOCHS = 90
+# Focal loss: gamma=0 = обычный CrossEntropy; gamma>0 усиливает трудные примеры
+# (уверенные ошибки вроде М<->Т), гасит лёгкие. Причина введения — REPORT_SINGLE_HAND.md §М/Т.
+FOCAL_GAMMA = 2.0
 
 TRIMMED_VIDEOS_DIR = "data/trimmed/"
 ANNOTATIONS_PATH = "data/annotations.tsv"

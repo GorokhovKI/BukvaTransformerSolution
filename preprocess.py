@@ -29,8 +29,21 @@ def normalize_landmarks(landmarks) -> np.ndarray:
     return np.clip(normalized, -5.0, 5.0).flatten()
 
 
+def _hand_features(frame_features: np.ndarray, hands_landmarks) -> None:
+    """Раскладывает руки по слотам: слот 0 — рука выше в кадре (в дактиле — рабочая)."""
+    ordered = sorted(hands_landmarks, key=lambda lms: lms.landmark[0].y)
+    for slot, lms in enumerate(ordered[:NUM_HANDS]):
+        frame_features[slot] = normalize_landmarks(lms.landmark).reshape(NUM_LANDMARKS, 3)
+
+
 def process_video(video_path: Path) -> np.ndarray | None:
-    """Обрабатывает одно видео, создавая отдельный экземпляр Hands на каждый вызов."""
+    """Обрабатывает одно видео в фиксированные слоты двух рук.
+
+    Дактиль одноручный, но вторая (нерабочая) рука часто в кадре; выбор «активной»
+    руки по движению ошибался (REPORT_SINGLE_HAND.md), поэтому слоты
+    детерминированы: 0 — самая высокая рука, 1 — вторая. Кадры без руки — нули,
+    временная структура сохраняется (важно для Ё и Й).
+    """
     mp_hands = mp.solutions.hands
     with mp_hands.Hands(
         static_image_mode=False,
@@ -47,17 +60,13 @@ def process_video(video_path: Path) -> np.ndarray | None:
             ret, frame = cap.read()
             if not ret:
                 break
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # selfie-ориентация как в demo.py
+            frame_rgb = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
             results = hands.process(frame_rgb)
 
             frame_features = np.zeros((NUM_HANDS, NUM_LANDMARKS, 3), dtype=np.float32)
             if results.multi_hand_landmarks:
-                for idx, landmarks in enumerate(results.multi_hand_landmarks):
-                    if idx >= NUM_HANDS:
-                        break
-                    norm_lm = normalize_landmarks(landmarks.landmark)
-                    frame_features[idx] = norm_lm.reshape(NUM_LANDMARKS, 3)
-
+                _hand_features(frame_features, results.multi_hand_landmarks)
             frames_data.append(frame_features.flatten())
         cap.release()
 
@@ -67,8 +76,7 @@ def process_video(video_path: Path) -> np.ndarray | None:
     features = np.array(frames_data, dtype=np.float32)
 
     # Фильтрация видео с >50% нулевых кадров (рука не обнаружена)
-    empty_ratio = (features.sum(axis=1) == 0).mean()
-    if empty_ratio > 0.5:
+    if (features.sum(axis=1) == 0).mean() > 0.5:
         return None
 
     return features

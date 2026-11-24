@@ -4,31 +4,47 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from torch.utils.data import DataLoader, Dataset
 
 from constants import (
+    ANNOTATIONS_PATH,
     BATCH_SIZE,
     CHECKPOINT_PATH,
     EPOCHS,
     FEATURES_DIR,
+    FOCAL_GAMMA,
     LEARNING_RATE,
     NUM_CLASSES,
     SEQUENCE_LENGTH,
 )
-from model import SignLanguageTransformer
+from model import ModelConfig, SignLanguageTransformer
 from plot import save_all_plots
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class SignDataset(Dataset):
-    def __init__(self, paths, labels, seq_len: int, augment: bool = False) -> None:
+    def __init__(
+        self,
+        paths,
+        labels,
+        seq_len: int,
+        augment: bool = False,
+        user_indices: np.ndarray | None = None,
+    ) -> None:
         self.paths = paths
         self.labels = labels
         self.seq_len = seq_len
         self.augment = augment
+        # None -> 0 (<unk>) для всех сэмплов
+        self.user_indices = (
+            np.zeros(len(paths), dtype=np.int64)
+            if user_indices is None
+            else np.asarray(user_indices, dtype=np.int64)
+        )
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -58,7 +74,22 @@ class SignDataset(Dataset):
             torch.from_numpy(features),
             torch.tensor(label, dtype=torch.long),
             torch.from_numpy(mask),
+            torch.tensor(self.user_indices[idx], dtype=torch.long),
         )
+
+
+def load_user_maps(annotation_path: str) -> tuple[dict[str, int], dict[str, str]]:
+    """(vocab: user_id -> idx по train-клипам, att_to_user: attachment_id -> user_id)."""
+    vocab: dict[str, int] = {}
+    att_to_user: dict[str, str] = {}
+    with open(annotation_path, encoding="utf-8") as f:
+        cols = {name: i for i, name in enumerate(f.readline().strip().split("\t"))}
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            att_to_user[parts[cols["attachment_id"]]] = parts[cols["user_id"]]
+            if parts[cols["train"]].strip() == "True":
+                vocab.setdefault(parts[cols["user_id"]], len(vocab) + 1)
+    return vocab, att_to_user
 
 
 def get_model_info(model: nn.Module) -> tuple[float, int]:
@@ -67,10 +98,15 @@ def get_model_info(model: nn.Module) -> tuple[float, int]:
     return (param_size + buffer_size) / 1024 ** 2, sum(p.numel() for p in model.parameters())
 
 
-def build_class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
-    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
-    counts[counts == 0] = 1.0
-    return torch.tensor(counts.sum() / (num_classes * counts), dtype=torch.float32, device=device)
+def focal_loss(logits: torch.Tensor, targets: torch.Tensor, gamma: float, label_smoothing: float = 0.0) -> torch.Tensor:
+    """Focal loss: гасит уверенно-верные примеры, усиливает трудные (ошибки).
+
+    gamma=0 -> обычный CrossEntropy (с label smoothing).
+    pt = вероятность истинного класса по softmax.
+    """
+    ce = F.cross_entropy(logits, targets, label_smoothing=label_smoothing, reduction="none")
+    pt = F.softmax(logits, dim=-1).gather(1, targets.unsqueeze(1)).squeeze(1)
+    return ((1.0 - pt) ** gamma * ce).mean()
 
 
 def build_optimizer(model: nn.Module, lr: float) -> optim.AdamW:
@@ -121,8 +157,31 @@ def train_model() -> None:
     else:
         class_names = [str(i) for i in range(NUM_CLASSES)]
 
-    train_ds = SignDataset(x_train, y_train, SEQUENCE_LENGTH, augment=True)
-    val_ds = SignDataset(x_val, y_val, SEQUENCE_LENGTH, augment=False)
+    # Пер-пользовательская обусловленность: train-клипы -> эмбеддинг своего пользователя,
+    # val всегда <unk> (0) — оценка обобщения на неизвестных пользователей.
+    user_vocab: dict[str, int] = {}
+    user_indices_train = np.zeros(len(x_train), dtype=np.int64)
+    annotation_path = Path(ANNOTATIONS_PATH)
+    if annotation_path.exists():
+        user_vocab, att_to_user = load_user_maps(annotation_path)
+        unmapped = 0
+        for i, p in enumerate(x_train):
+            u = att_to_user.get(Path(p).stem)
+            if u in user_vocab:
+                user_indices_train[i] = user_vocab[u]
+            else:
+                unmapped += 1
+        test_users = {att_to_user.get(Path(p).stem) for p in x_val}
+        assert not (test_users & set(user_vocab)), "Утечка сплита: пересечение пользователей train/test"
+        print(
+            f"User-cond: {len(user_vocab)} пользователей в train | "
+            f"клипов без маппинга: {unmapped} | сплит чист"
+        )
+    else:
+        print(f"Аннотации не найдены ({annotation_path}) — обучаем без user-cond (user_dim=0)")
+
+    train_ds = SignDataset(x_train, y_train, SEQUENCE_LENGTH, augment=True, user_indices=user_indices_train)
+    val_ds = SignDataset(x_val, y_val, SEQUENCE_LENGTH, augment=False)  # все <unk>
 
     num_workers = 0
     train_loader = DataLoader(
@@ -140,13 +199,11 @@ def train_model() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model = SignLanguageTransformer().to(device)
+    model = SignLanguageTransformer(ModelConfig(user_dim=len(user_vocab) + 1 if user_vocab else 0)).to(device)
     nn.init.trunc_normal_(model.cls_token, std=0.02)
     size_mb, n_params = get_model_info(model)
     print(f"Модель: {n_params/1e6:.2f} млн параметров | {size_mb:.2f} МБ | устройство: {device}")
 
-    class_weights = build_class_weights(y_train, NUM_CLASSES)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     optimizer = build_optimizer(model, LEARNING_RATE)
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -180,11 +237,11 @@ def train_model() -> None:
         model.train()
         train_loss, train_correct, train_total = 0.0, 0, 0
 
-        for x, y, mask in train_loader:
-            x, y, mask = x.to(device), y.to(device), mask.to(device)
+        for x, y, mask, uidx in train_loader:
+            x, y, mask, uidx = x.to(device), y.to(device), mask.to(device), uidx.to(device)
             optimizer.zero_grad()
-            output = model(x, src_key_padding_mask=mask)
-            loss = criterion(output, y)
+            output = model(x, src_key_padding_mask=mask, user_idx=uidx)
+            loss = focal_loss(output, y, gamma=FOCAL_GAMMA, label_smoothing=0.1)
             loss.backward()
 
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
@@ -206,10 +263,10 @@ def train_model() -> None:
         val_preds, val_targets = [], []
 
         with torch.no_grad():
-            for x, y, mask in val_loader:
-                x, y, mask = x.to(device), y.to(device), mask.to(device)
-                output = model(x, src_key_padding_mask=mask)
-                val_loss += criterion(output, y).item()
+            for x, y, mask, uidx in val_loader:
+                x, y, mask, uidx = x.to(device), y.to(device), mask.to(device), uidx.to(device)
+                output = model(x, src_key_padding_mask=mask, user_idx=uidx)
+                val_loss += focal_loss(output, y, gamma=FOCAL_GAMMA, label_smoothing=0.1).item()
                 preds = output.argmax(dim=1)
                 val_correct += (preds == y).sum().item()
                 val_total += y.size(0)
@@ -241,6 +298,7 @@ def train_model() -> None:
                     "model_config": model.config,
                     "epoch": epoch + 1,
                     "best_f1": best_f1,
+                    "user_vocab": user_vocab,
                 },
                 CHECKPOINT_PATH,
             )
@@ -262,9 +320,9 @@ def train_model() -> None:
 
     all_preds, all_labels, all_proba = [], [], []
     with torch.no_grad():
-        for x, y, mask in val_loader:
-            x, y, mask = x.to(device), y.to(device), mask.to(device)
-            logits = model(x, src_key_padding_mask=mask)
+        for x, y, mask, uidx in val_loader:
+            x, y, mask, uidx = x.to(device), y.to(device), mask.to(device), uidx.to(device)
+            logits = model(x, src_key_padding_mask=mask, user_idx=uidx)
             proba = torch.softmax(logits, dim=1)
             preds = logits.argmax(dim=1)
             all_preds.extend(preds.cpu().numpy())
